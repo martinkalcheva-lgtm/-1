@@ -112,6 +112,9 @@ function animateBg(ctx, w, h, time) {
 function initBg() {
   const canvas = bgCanvas.value
   if (!canvas) return
+  // 亮色商务主题下 .bg-canvas 已被 display:none 隐藏，粒子动画不再启动
+  // （想恢复粒子背景：删掉样式里 .bg-canvas 的 display: none 即可）
+  if (window.getComputedStyle(canvas).display === 'none') return
   const ctx = canvas.getContext('2d')
 
   const resize = () => {
@@ -760,7 +763,9 @@ function speakByDigitalHuman(text) {
 }
 
 function handleDhWindowResize() {
-  // 面板宽度随窗口变化时，让数字人重新适配布局
+  // 窗口尺寸变化时，先把悬浮窗夹回卡片内，再让数字人重新适配布局
+  const widget = dhWidgetEl.value
+  if (widget) dhClampToCard(parseFloat(widget.style.left) || 0, parseFloat(widget.style.top) || 0)
   if (dhStatus.value === 'ready') applyDigitalHumanLayout()
 }
 
@@ -773,16 +778,199 @@ function handleDhBeforeUnload() {
   }
 }
 
+// ── 数字人悬浮窗：拖动 / 缩放 / 收起（只能在聊天卡片内活动）──────────
+const dhWidgetEl = ref(null)
+const chatCardEl = ref(null)
+const sidebarEl = ref(null)
+const dhCollapsed = ref(false)
+
+const DH_MIN_W = 130
+const DH_MIN_H = 210
+const DH_MAX_W = 340
+const DH_MAX_H = 560
+const DH_CIRCLE = 56
+const DH_RIGHT_GAP = 18
+const DH_ANIM_MS = 340
+
+let dhDragState = null
+let dhResizeState = null
+let dhDragMoved = false
+let dhSavedBox = { left: 24, top: 120, width: 176, height: 292 }
+
+// 阻止事件继续冒泡（收起按钮要用，免得点一下被当成拖动）
+function stopPointerEvent(event) {
+  event.stopPropagation()
+}
+
+function dhBump() {
+  const card = chatCardEl.value
+  if (!card) return
+  card.classList.add('boundary-hit')
+  window.setTimeout(() => card.classList.remove('boundary-hit'), 280)
+}
+
+function dhClampToCard(left, top) {
+  const card = chatCardEl.value
+  const widget = dhWidgetEl.value
+  if (!card || !widget) return
+  const maxX = Math.max(6, card.clientWidth - widget.offsetWidth - 6)
+  const maxY = Math.max(6, card.clientHeight - widget.offsetHeight - 6)
+  const nx = Math.min(Math.max(left, 6), maxX)
+  const ny = Math.min(Math.max(top, 6), maxY)
+  if (Math.round(nx) !== Math.round(left) || Math.round(ny) !== Math.round(top)) dhBump()
+  widget.style.left = nx + 'px'
+  widget.style.top = ny + 'px'
+  widget.style.bottom = 'auto'
+}
+
+// 初始摆位：卡片左下角、离底部 104px
+function initDhWidgetPlacement() {
+  const card = chatCardEl.value
+  const widget = dhWidgetEl.value
+  if (!card || !widget) return
+  widget.style.width = '176px'
+  widget.style.height = '292px'
+  dhClampToCard(24, card.clientHeight - widget.offsetHeight - 104)
+}
+
+function onDhPointerDown(event) {
+  const widget = dhWidgetEl.value
+  const card = chatCardEl.value
+  if (!widget || !card) return
+  const wr = widget.getBoundingClientRect()
+  const cr = card.getBoundingClientRect()
+  dhDragMoved = false
+  dhDragState = {
+    startX: event.clientX,
+    startY: event.clientY,
+    originLeft: wr.left - cr.left,
+    originTop: wr.top - cr.top,
+  }
+  widget.classList.add('dragging')
+  try { event.currentTarget.setPointerCapture(event.pointerId) } catch (_) { /* 忽略 */ }
+  event.preventDefault()
+}
+
+function onDhResizeDown(event) {
+  const widget = dhWidgetEl.value
+  if (!widget) return
+  dhResizeState = {
+    startX: event.clientX,
+    startY: event.clientY,
+    width: widget.offsetWidth,
+    height: widget.offsetHeight,
+  }
+  try { event.currentTarget.setPointerCapture(event.pointerId) } catch (_) { /* 忽略 */ }
+  event.preventDefault()
+}
+
+function onDhPointerMove(event) {
+  if (dhDragState) {
+    const dx = event.clientX - dhDragState.startX
+    const dy = event.clientY - dhDragState.startY
+    if (Math.abs(dx) > 3 || Math.abs(dy) > 3) dhDragMoved = true
+    dhClampToCard(dhDragState.originLeft + dx, dhDragState.originTop + dy)
+    return
+  }
+  if (dhResizeState) {
+    const widget = dhWidgetEl.value
+    if (!widget) return
+    const width = Math.min(Math.max(dhResizeState.width + (event.clientX - dhResizeState.startX), DH_MIN_W), DH_MAX_W)
+    const height = Math.min(Math.max(dhResizeState.height + (event.clientY - dhResizeState.startY), DH_MIN_H), DH_MAX_H)
+    widget.style.width = width + 'px'
+    widget.style.height = height + 'px'
+    dhClampToCard(parseFloat(widget.style.left) || 0, parseFloat(widget.style.top) || 0)
+  }
+}
+
+function onDhPointerUp() {
+  const widget = dhWidgetEl.value
+  if (dhDragState) {
+    dhDragState = null
+    if (widget) widget.classList.remove('dragging')
+    // 收起态圆圈上「没拖动」的一下 = 展开；拖动过就不算点击
+    if (dhCollapsed.value && !dhDragMoved) expandDhWidget()
+    else if (dhStatus.value === 'ready') applyDigitalHumanLayout()
+    return
+  }
+  if (dhResizeState) {
+    dhResizeState = null
+    if (dhStatus.value === 'ready') applyDigitalHumanLayout()
+  }
+}
+
+// 收起：缩成 56px 的小圆圈，贴到卡片右侧
+function collapseDhWidget() {
+  const widget = dhWidgetEl.value
+  const card = chatCardEl.value
+  if (!widget || !card || dhCollapsed.value) return
+  const wr = widget.getBoundingClientRect()
+  const cr = card.getBoundingClientRect()
+  dhSavedBox = {
+    left: wr.left - cr.left,
+    top: wr.top - cr.top,
+    width: widget.offsetWidth,
+    height: widget.offsetHeight,
+  }
+  widget.classList.add('animating')
+  widget.classList.add('collapsed')
+  dhCollapsed.value = true
+  widget.style.width = DH_CIRCLE + 'px'
+  widget.style.height = DH_CIRCLE + 'px'
+  const nx = Math.max(6, card.clientWidth - DH_CIRCLE - DH_RIGHT_GAP)
+  const ny = Math.min(Math.max(dhSavedBox.top, 6), Math.max(6, card.clientHeight - DH_CIRCLE - 6))
+  widget.style.left = nx + 'px'
+  widget.style.top = ny + 'px'
+  widget.style.bottom = 'auto'
+  window.setTimeout(() => widget.classList.remove('animating'), DH_ANIM_MS)
+}
+
+// 展开：回到收起前的位置与尺寸
+function expandDhWidget() {
+  const widget = dhWidgetEl.value
+  if (!widget || !dhCollapsed.value) return
+  widget.classList.add('animating')
+  widget.classList.remove('collapsed')
+  dhCollapsed.value = false
+  widget.style.width = dhSavedBox.width + 'px'
+  widget.style.height = dhSavedBox.height + 'px'
+  dhClampToCard(dhSavedBox.left, dhSavedBox.top)
+  window.setTimeout(() => {
+    widget.classList.remove('animating')
+    if (dhStatus.value === 'ready') applyDigitalHumanLayout()
+  }, DH_ANIM_MS)
+}
+
+// 业务对象面板：收起 / 展开（聊天卡片会跟着变宽，数字人要重新夹边）
+function toggleSidebarPanel() {
+  const el = sidebarEl.value
+  if (!el) return
+  el.classList.toggle('collapsed')
+  window.setTimeout(() => {
+    const widget = dhWidgetEl.value
+    if (widget && !dhCollapsed.value) {
+      dhClampToCard(parseFloat(widget.style.left) || 0, parseFloat(widget.style.top) || 0)
+    }
+    if (dhStatus.value === 'ready') applyDigitalHumanLayout()
+  }, DH_ANIM_MS)
+}
+
 onMounted(async () => {
   initBg()
   window.addEventListener('resize', handleDhWindowResize)
   window.addEventListener('beforeunload', handleDhBeforeUnload)
+  window.addEventListener('pointermove', onDhPointerMove)
+  window.addEventListener('pointerup', onDhPointerUp)
   await Promise.all([fetchSidebarData(), fetchChatHistory()])
+  await nextTick()
+  initDhWidgetPlacement()
 })
 
 onUnmounted(() => {
   window.removeEventListener('resize', handleDhWindowResize)
   window.removeEventListener('beforeunload', handleDhBeforeUnload)
+  window.removeEventListener('pointermove', onDhPointerMove)
+  window.removeEventListener('pointerup', onDhPointerUp)
   if (bgCanvas.value?._cleanup) bgCanvas.value._cleanup()
   // 释放魔珐星云连接，避免占用并发额度（错误码 10005）
   try {
@@ -848,63 +1036,8 @@ async function copyBotText(botMsg) {
   <div class="app-shell">
     <canvas ref="bgCanvas" class="bg-canvas"></canvas>
     <div class="app-layout">
-      <aside class="dh-panel">
-        <div class="dh-panel-header">
-          <span class="dh-status-dot" :class="`dh-dot-${dhStatus}`"></span>
-          <span class="dh-panel-title">{{ DH_STATUS_TEXT[dhStatus] }}</span>
-        </div>
-
-        <div class="dh-stage">
-          <div class="dh-stage-inner">
-            <!-- 容器常驻 DOM：SDK init 期间就必须能找到它，占位内容用覆盖层呈现 -->
-            <div id="digital-human-sdk" ref="dhContainer" class="dh-canvas"></div>
-
-            <div v-if="dhStatus === 'loading'" class="dh-overlay dh-placeholder dh-placeholder-loading">
-              <div class="dh-spinner"></div>
-              <p class="dh-placeholder-title">正在加载数字人…</p>
-              <div class="dh-progress">
-                <div class="dh-progress-bar" :style="{ width: dhProgress + '%' }"></div>
-              </div>
-              <p class="dh-placeholder-sub">{{ dhProgress }}% · {{ dhStageText }}</p>
-            </div>
-
-            <div v-else-if="dhStatus === 'error'" class="dh-overlay dh-placeholder dh-placeholder-error">
-              <div class="dh-placeholder-icon">!</div>
-              <p class="dh-placeholder-title">连接失败</p>
-              <p class="dh-placeholder-sub">{{ dhError }}</p>
-            </div>
-
-            <div v-else-if="dhStatus === 'idle'" class="dh-overlay dh-placeholder">
-              <div class="dh-placeholder-icon dh-placeholder-icon-idle">
-                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-                  <circle cx="12" cy="8" r="3.4" />
-                  <path d="M4.6 20c0-3.6 3.3-6.2 7.4-6.2s7.4 2.6 7.4 6.2" />
-                </svg>
-              </div>
-              <p class="dh-placeholder-title">数字人待连接</p>
-              <p class="dh-placeholder-sub">点击下方按钮加载 3D 形象</p>
-            </div>
-          </div>
-        </div>
-
-        <div class="dh-actions">
-          <button
-            type="button"
-            class="dh-button"
-            :class="{ 'dh-button-danger': dhStatus === 'ready' }"
-            :disabled="dhStatus === 'loading'"
-            @click="toggleDigitalHuman"
-          >
-            <template v-if="dhStatus === 'loading'">连接中… {{ dhProgress }}%</template>
-            <template v-else-if="dhStatus === 'ready'">断开连接</template>
-            <template v-else-if="dhStatus === 'error'">重试连接</template>
-            <template v-else>连接数字人</template>
-          </button>
-        </div>
-      </aside>
-
       <div class="workspace">
-      <div class="chat-card">
+      <div ref="chatCardEl" class="chat-card">
         <header class="chat-header">
           <div class="header-content">
             <div class="header-info">
@@ -1135,9 +1268,99 @@ async function copyBotText(botMsg) {
             {{ isSending ? '发送中...' : '发送' }}
           </button>
         </form>
+
+        <!-- ============ 数字人悬浮窗（只能在这张卡片内活动）============ -->
+        <div ref="dhWidgetEl" class="dh-widget">
+          <div class="dh-widget-bar" title="按住这里拖动数字人" @pointerdown="onDhPointerDown">
+            <span class="dh-status-dot" :class="`dh-dot-${dhStatus}`"></span>
+            <span class="dh-widget-title">{{ DH_STATUS_TEXT[dhStatus] }}</span>
+            <span class="dh-widget-grip">⠿</span>
+            <button
+              type="button"
+              class="dh-widget-collapse"
+              title="收起为小圆圈"
+              @pointerdown="stopPointerEvent"
+              @click.stop="collapseDhWidget"
+            >➖</button>
+          </div>
+
+          <div class="dh-stage">
+            <div class="dh-stage-inner">
+              <!-- 容器常驻 DOM：SDK init 期间就必须能找到它 -->
+              <div id="digital-human-sdk" ref="dhContainer" class="dh-canvas"></div>
+
+              <div v-if="dhStatus === 'loading'" class="dh-overlay dh-placeholder dh-placeholder-loading">
+                <div class="dh-spinner"></div>
+                <p class="dh-placeholder-title">正在加载数字人…</p>
+                <div class="dh-progress">
+                  <div class="dh-progress-bar" :style="{ width: dhProgress + '%' }"></div>
+                </div>
+                <p class="dh-placeholder-sub">{{ dhProgress }}% · {{ dhStageText }}</p>
+              </div>
+
+              <div v-else-if="dhStatus === 'error'" class="dh-overlay dh-placeholder dh-placeholder-error">
+                <div class="dh-placeholder-icon">!</div>
+                <p class="dh-placeholder-title">连接失败</p>
+                <p class="dh-placeholder-sub">{{ dhError }}</p>
+              </div>
+
+              <div v-else-if="dhStatus === 'idle'" class="dh-overlay dh-placeholder">
+                <div class="dh-placeholder-icon dh-placeholder-icon-idle">
+                  <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                    <circle cx="12" cy="8" r="3.4" />
+                    <path d="M4.6 20c0-3.6 3.3-6.2 7.4-6.2s7.4 2.6 7.4 6.2" />
+                  </svg>
+                </div>
+                <p class="dh-placeholder-title">数字人待连接</p>
+                <p class="dh-placeholder-sub">点下方按钮加载 3D 形象</p>
+              </div>
+            </div>
+          </div>
+
+          <div class="dh-actions">
+            <button
+              type="button"
+              class="dh-button"
+              :class="{ 'dh-button-danger': dhStatus === 'ready' }"
+              :disabled="dhStatus === 'loading'"
+              @click="toggleDigitalHuman"
+            >
+              <template v-if="dhStatus === 'loading'">连接中… {{ dhProgress }}%</template>
+              <template v-else-if="dhStatus === 'ready'">断开连接</template>
+              <template v-else-if="dhStatus === 'error'">重试连接</template>
+              <template v-else>连接数字人</template>
+            </button>
+          </div>
+
+          <div class="dh-widget-resize" title="拖动可放大/缩小" @pointerdown="onDhResizeDown"></div>
+
+          <!-- 收起后的圆圈：可拖、点一下展开 -->
+          <div class="dh-widget-circle" title="点击展开数字人" @pointerdown="onDhPointerDown">
+            <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                 stroke-width="1.6" stroke-linecap="round">
+              <circle cx="12" cy="8" r="3.6" />
+              <path d="M4.8 20c0-3.7 3.3-6.5 7.2-6.5s7.2 2.8 7.2 6.5" />
+            </svg>
+            <span class="dh-status-dot dh-widget-circle-dot" :class="`dh-dot-${dhStatus}`"></span>
+          </div>
+        </div>
+
       </div>
 
-      <aside class="sidebar">
+      <aside ref="sidebarEl" class="sidebar">
+        <button
+          type="button"
+          class="biz-edge-btn"
+          title="收起业务对象"
+          aria-label="收起业务对象"
+          @click="toggleSidebarPanel"
+        >
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+               stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="9 5 16 12 9 19" />
+          </svg>
+        </button>
+
         <div class="sidebar-header">
           <h2>业务对象</h2>
         </div>
@@ -1230,6 +1453,11 @@ async function copyBotText(botMsg) {
             </button>
           </article>
         </div>
+
+        <!-- 收起后的窄竖条：点它展开 -->
+        <div class="sidebar-collapsed-face" @click="toggleSidebarPanel">
+          <span class="sidebar-vertical-text">业务对象</span>
+        </div>
       </aside>
       </div>
     </div>
@@ -1243,58 +1471,59 @@ async function copyBotText(botMsg) {
 }
 
 :global(:root) {
+  color-scheme: light;
   /* ── Palette ── */
-  --color-bg-deep: #070a14;
-  --color-bg-mid: #0c1024;
-  --color-bg-surface: #11162b;
-  /* Dark frosted glass — emerges from background, doesn't sit on top */
-  --color-surface: rgba(14, 16, 30, 0.78);
-  --color-surface-hover: rgba(20, 22, 38, 0.86);
-  --color-surface-dim: rgba(14, 16, 30, 0.60);
-  --color-surface-raised: rgba(24, 26, 44, 0.70);
-  --color-surface-field: rgba(10, 12, 22, 0.62);
-  /* Light text on dark surfaces */
-  --color-text-primary: #e6e3dc;
-  --color-text-secondary: #9b9790;
-  --color-text-muted: #726f68;
-  --color-text-inverse: #18171c;
-  /* Accent — teal */
-  --color-accent: #2dd4bf;
-  --color-accent-strong: #14b8a6;
-  --color-accent-soft: rgba(45, 212, 191, 0.10);
-  --color-accent-glow: rgba(45, 212, 191, 0.20);
-  --color-accent-soft-bg: rgba(45, 212, 191, 0.06);
-  /* Warm — amber */
-  --color-warm: #f59e0b;
-  --color-warm-strong: #d97706;
-  --color-warm-soft: rgba(245, 158, 11, 0.10);
-  --color-warm-glow: rgba(245, 158, 11, 0.18);
-  --color-warm-soft-bg: rgba(245, 158, 11, 0.05);
+  --color-bg-deep: #eef2f8;
+  --color-bg-mid: #f5f7fb;
+  --color-bg-surface: #ffffff;
+  /* 亮色卡片表面（纯白）*/
+  --color-surface: #ffffff;
+  --color-surface-hover: #f7f9fc;
+  --color-surface-dim: #f7f9fc;
+  --color-surface-raised: #f7f9fc;
+  --color-surface-field: #ffffff;
+  /* 深色文字压在亮色表面上 */
+  --color-text-primary: #16233a;
+  --color-text-secondary: #5b6b83;
+  --color-text-muted: #8a97ab;
+  --color-text-inverse: #ffffff;
+  /* Accent — 商务蓝 */
+  --color-accent: #1a56db;
+  --color-accent-strong: #1444b8;
+  --color-accent-soft: rgba(26, 86, 219, 0.10);
+  --color-accent-glow: rgba(26, 86, 219, 0.16);
+  --color-accent-soft-bg: rgba(26, 86, 219, 0.05);
+  /* Warm — 暖棕 */
+  --color-warm: #b45309;
+  --color-warm-strong: #92400e;
+  --color-warm-soft: rgba(180, 83, 9, 0.10);
+  --color-warm-glow: rgba(180, 83, 9, 0.12);
+  --color-warm-soft-bg: rgba(180, 83, 9, 0.05);
   /* Semantic */
-  --color-success: #34d399;
-  --color-success-soft: rgba(52, 211, 153, 0.12);
-  --color-info: #38bdf8;
-  --color-info-soft: rgba(56, 189, 248, 0.10);
-  --color-danger: #fb7185;
-  --color-danger-soft: rgba(251, 113, 133, 0.10);
-  /* Borders — subtle light lines on dark glass */
-  --color-border: rgba(255, 255, 255, 0.08);
-  --color-border-light: rgba(255, 255, 255, 0.05);
-  --color-border-strong: rgba(255, 255, 255, 0.13);
+  --color-success: #15803d;
+  --color-success-soft: rgba(21, 128, 61, 0.12);
+  --color-info: #0369a1;
+  --color-info-soft: rgba(3, 105, 161, 0.10);
+  --color-danger: #dc2626;
+  --color-danger-soft: rgba(220, 38, 38, 0.10);
+  /* 边框：浅灰细线 */
+  --color-border: #e2e8f0;
+  --color-border-light: #eef2f7;
+  --color-border-strong: #cbd5e1;
   /* ── Radii ── */
   --radius-sm: 10px;
   --radius-md: 16px;
   --radius-lg: 24px;
   --radius-xl: 28px;
   --radius-full: 9999px;
-  /* ── Shadows (glow-based for dark theme) ── */
-  --shadow-xs: 0 1px 3px rgba(0, 0, 0, 0.18);
-  --shadow-sm: 0 4px 14px rgba(0, 0, 0, 0.22);
-  --shadow-md: 0 8px 32px rgba(0, 0, 0, 0.28);
-  --shadow-lg: 0 20px 56px rgba(0, 0, 0, 0.35);
-  --shadow-glow-teal: 0 0 60px rgba(45, 212, 191, 0.10), 0 0 120px rgba(45, 212, 191, 0.04);
-  --shadow-glow-amber: 0 0 50px rgba(245, 158, 11, 0.08), 0 0 100px rgba(245, 158, 11, 0.03);
-  --shadow-inner-glow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
+  /* ── 阴影（浅色主题：柔和投影）── */
+  --shadow-xs: 0 1px 2px rgba(15, 42, 74, 0.06);
+  --shadow-sm: 0 2px 8px rgba(15, 42, 74, 0.07);
+  --shadow-md: 0 6px 20px rgba(15, 42, 74, 0.08);
+  --shadow-lg: 0 12px 32px rgba(15, 42, 74, 0.08);
+  --shadow-glow-teal: 0 8px 30px rgba(26, 86, 219, 0.10);
+  --shadow-glow-amber: 0 8px 30px rgba(180, 83, 9, 0.08);
+  --shadow-inner-glow: inset 0 1px 0 rgba(255, 255, 255, 0.60);
   /* ── Transitions ── */
   --ease-out-expo: cubic-bezier(0.16, 1, 0.3, 1);
   --ease-out-back: cubic-bezier(0.34, 1.56, 0.64, 1);
@@ -1327,9 +1556,7 @@ async function copyBotText(botMsg) {
   padding: 24px;
   position: relative;
   overflow: hidden;
-  background: linear-gradient(165deg, #070a14 0%, #0c1024 25%, #0a0f1f 50%, #0c1024 75%, #080d1c 100%);
-  background-size: 400% 400%;
-  animation: bgShift 24s ease-in-out infinite;
+  background: linear-gradient(180deg, #f8fafd 0%, #eef2f8 100%);
 }
 /* Subtle grain texture overlay */
 .app-shell::before {
@@ -1347,6 +1574,8 @@ async function copyBotText(botMsg) {
   inset: 0;
   z-index: 0;
   pointer-events: none;
+  /* 亮色商务主题下隐藏粒子画布；想恢复删掉这行 */
+  display: none;
 }
 
 .app-shell::after {
@@ -1359,7 +1588,7 @@ async function copyBotText(botMsg) {
 /* Teal orb — top left */
 .app-shell::after {
   width: 820px; height: 820px;
-  background: radial-gradient(circle, rgba(13, 148, 136, 0.18) 0%, rgba(20, 184, 166, 0.06) 35%, transparent 70%);
+  background: radial-gradient(circle, rgba(26, 86, 219, 0.10) 0%, rgba(26, 86, 219, 0.04) 38%, transparent 70%);
   top: -320px; left: -280px;
   animation: orb1 20s ease-in-out infinite;
 }
@@ -1371,7 +1600,7 @@ async function copyBotText(botMsg) {
   pointer-events: none;
   z-index: 0;
   width: 640px; height: 640px;
-  background: radial-gradient(circle, rgba(217, 119, 6, 0.13) 0%, rgba(245, 158, 11, 0.05) 40%, transparent 70%);
+  background: radial-gradient(circle, rgba(59, 130, 246, 0.08) 0%, rgba(59, 130, 246, 0.03) 42%, transparent 70%);
   bottom: -280px; right: -220px;
   animation: orb2 24s ease-in-out infinite;
 }
@@ -1408,47 +1637,13 @@ async function copyBotText(botMsg) {
   width: auto;
   margin: 0;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 370px;
+  grid-template-columns: minmax(0, 1fr) auto;
   gap: 22px;
   position: relative;
   z-index: 1;
 }
 
-/* ── 数字人面板 ───────────────────────────────────────────── */
-.dh-panel {
-  flex: 0 0 33.333%;
-  min-width: 320px;
-  max-width: 640px;
-  min-height: calc(100vh - 48px);
-  height: calc(100vh - 48px);
-  display: flex;
-  flex-direction: column;
-  background: var(--color-surface);
-  backdrop-filter: blur(32px) saturate(1.2);
-  -webkit-backdrop-filter: blur(32px) saturate(1.2);
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-lg);
-  overflow: hidden;
-  box-shadow: var(--shadow-lg), var(--shadow-inner-glow);
-  transition: border-color var(--duration-slow) var(--ease-in-out);
-}
-.dh-panel:hover {
-  border-color: rgba(45, 212, 191, 0.15);
-}
-
-.dh-panel-header {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 14px 18px;
-  border-bottom: 1px solid var(--color-border-light);
-  flex-shrink: 0;
-}
-.dh-panel-title {
-  font-size: 13px;
-  font-weight: 500;
-  color: var(--color-text-secondary);
-}
+/* ── 数字人悬浮窗（见下方 .dh-widget）── ──────────────────────────────────────────── */
 .dh-status-dot {
   width: 8px;
   height: 8px;
@@ -1483,7 +1678,7 @@ async function copyBotText(botMsg) {
   inset: 0;
   width: 100%;
   height: 100%;
-  background: #05070d;
+  background: linear-gradient(180deg, #eef4ff, #dce7fa);
   overflow: hidden;
 }
 
@@ -1597,33 +1792,237 @@ async function copyBotText(botMsg) {
   background: var(--color-danger-soft);
 }
 
+/* ── 数字人悬浮窗（挂在聊天卡片内部，只能在这张卡片里活动）──────────── */
+.dh-widget {
+  position: absolute;
+  left: 24px;
+  bottom: 104px;
+  width: 176px;
+  height: 292px;
+  z-index: 40;
+  display: flex;
+  flex-direction: column;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+  box-shadow: var(--shadow-md);
+}
+.dh-widget:hover {
+  box-shadow: var(--shadow-lg), 0 0 0 2px rgba(26, 86, 219, 0.16);
+}
+.dh-widget.animating {
+  transition: width 240ms cubic-bezier(0.2, 0.8, 0.2, 1),
+              height 240ms cubic-bezier(0.2, 0.8, 0.2, 1),
+              border-radius 240ms ease,
+              box-shadow var(--duration-base) var(--ease-in-out);
+}
+
+.dh-widget-bar {
+  height: 30px;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 0 6px 0 10px;
+  background: var(--color-accent-soft-bg);
+  border-bottom: 1px solid var(--color-border-light);
+  cursor: grab;
+  user-select: none;
+  touch-action: none;
+}
+.dh-widget-bar:active { cursor: grabbing; }
+.dh-widget-title {
+  flex: 1;
+  min-width: 0;
+  font-size: 11px;
+  color: var(--color-text-secondary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.dh-widget-grip {
+  flex-shrink: 0;
+  font-size: 12px;
+  color: var(--color-accent);
+  letter-spacing: 1px;
+  padding: 2px 4px;
+  border-radius: 6px;
+}
+.dh-widget-collapse {
+  flex-shrink: 0;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--color-text-secondary);
+  font-size: 11px;
+  line-height: 1;
+  cursor: pointer;
+  transition: background var(--duration-fast) ease, color var(--duration-fast) ease;
+}
+.dh-widget-collapse:hover {
+  background: var(--color-accent-soft);
+  color: var(--color-accent);
+}
+
+/* 悬浮窗内的舞台与按钮：把大面板时的尺寸压小 */
+.dh-widget .dh-stage { padding: 0; }
+.dh-widget .dh-stage-inner { border-radius: 0; }
+.dh-widget .dh-actions {
+  padding: 7px 8px 8px;
+  border-top: 1px solid var(--color-border-light);
+  background: var(--color-surface-raised);
+}
+.dh-widget .dh-button {
+  min-height: 30px;
+  padding: 5px 8px;
+  font-size: 11px;
+  border-radius: 8px;
+}
+.dh-widget .dh-placeholder { gap: 6px; padding: 10px; }
+.dh-widget .dh-placeholder-title { font-size: 12px; }
+.dh-widget .dh-placeholder-sub { font-size: 10px; line-height: 1.5; }
+.dh-widget .dh-placeholder-icon { width: 34px; height: 34px; font-size: 14px; }
+
+.dh-widget-resize {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  width: 16px;
+  height: 16px;
+  z-index: 4;
+  cursor: nwse-resize;
+  touch-action: none;
+  background: linear-gradient(135deg, transparent 45%, rgba(26, 86, 219, 0.45) 45%, rgba(26, 86, 219, 0.45) 60%, transparent 60%,
+                                      transparent 72%, rgba(26, 86, 219, 0.45) 72%, rgba(26, 86, 219, 0.45) 87%, transparent 87%);
+}
+
+/* 收起态：变成贴在卡片右侧的小圆圈 */
+.dh-widget.collapsed { border-radius: 50%; }
+.dh-widget.collapsed .dh-widget-bar,
+.dh-widget.collapsed .dh-stage,
+.dh-widget.collapsed .dh-actions,
+.dh-widget.collapsed .dh-widget-resize { display: none; }
+.dh-widget-circle {
+  display: none;
+  position: relative;
+  width: 100%;
+  height: 100%;
+  align-items: center;
+  justify-content: center;
+  cursor: grab;
+  touch-action: none;
+  color: var(--color-accent);
+  background: radial-gradient(circle at 38% 30%, #f4f8ff, #d7e4ff 74%);
+}
+.dh-widget.collapsed .dh-widget-circle { display: flex; }
+.dh-widget-circle:active { cursor: grabbing; }
+.dh-widget-circle-dot {
+  position: absolute;
+  right: 5px;
+  bottom: 5px;
+  width: 9px;
+  height: 9px;
+  border: 2px solid #ffffff;
+}
+.chat-card.boundary-hit {
+  box-shadow: var(--shadow-lg), inset 0 0 0 2px rgba(26, 86, 219, 0.45);
+}
+
+/* ── 业务对象面板：左侧中间的收起按钮 + 收起态竖条 ────────────────────── */
+.biz-edge-btn {
+  position: absolute;
+  left: -21px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 22px;
+  height: 52px;
+  padding: 0;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--color-border);
+  border-right: none;
+  border-radius: 10px 0 0 10px;
+  background: #ffffff;
+  color: var(--color-accent);
+  box-shadow: -4px 0 12px rgba(15, 42, 74, 0.08);
+  cursor: pointer;
+  transition: background var(--duration-fast) ease, color var(--duration-fast) ease, border-color var(--duration-fast) ease;
+}
+.biz-edge-btn:hover {
+  background: var(--color-accent);
+  color: #ffffff;
+  border-color: var(--color-accent);
+}
+.biz-edge-btn svg { transition: transform 260ms ease; }
+.sidebar.collapsed .biz-edge-btn svg { transform: rotate(180deg); }
+
+.sidebar.collapsed {
+  width: 58px;
+  padding: 16px 8px;
+  align-items: center;
+}
+.sidebar.collapsed > *:not(.sidebar-collapsed-face):not(.biz-edge-btn) { display: none; }
+.sidebar-collapsed-face { display: none; }
+.sidebar.collapsed .sidebar-collapsed-face {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 100%;
+  cursor: pointer;
+  user-select: none;
+}
+.sidebar-vertical-text {
+  writing-mode: vertical-rl;
+  text-orientation: upright;
+  letter-spacing: 4px;
+  font-size: 13px;
+  font-weight: 700;
+  color: #12263f;
+  white-space: nowrap;
+}
+
 .chat-card,
 .sidebar {
   min-height: calc(100vh - 48px);
   height: calc(100vh - 48px);
   background: var(--color-surface);
-  backdrop-filter: blur(32px) saturate(1.2);
-  -webkit-backdrop-filter: blur(32px) saturate(1.2);
   border: 1px solid var(--color-border);
   border-radius: var(--radius-lg);
   overflow: hidden;
   transition: border-color var(--duration-slow) var(--ease-in-out), box-shadow var(--duration-slow) var(--ease-in-out);
 }
 .chat-card {
+  position: relative;
   display: flex;
   flex-direction: column;
   box-shadow: var(--shadow-glow-teal), var(--shadow-lg), var(--shadow-inner-glow);
 }
 .chat-card:hover {
-  border-color: rgba(45, 212, 191, 0.15);
+  border-color: rgba(26, 86, 219, 0.22);
 }
 .sidebar {
+  position: relative;
+  width: 370px;
   display: flex;
   flex-direction: column;
   box-shadow: var(--shadow-glow-amber), var(--shadow-lg), var(--shadow-inner-glow);
+  transition: width 280ms cubic-bezier(0.2, 0.8, 0.2, 1), padding 280ms ease,
+              border-color var(--duration-slow) var(--ease-in-out),
+              box-shadow var(--duration-slow) var(--ease-in-out);
 }
 .sidebar:hover {
-  border-color: rgba(245, 158, 11, 0.15);
+  border-color: rgba(26, 86, 219, 0.22);
 }
 
 .chat-header,
@@ -1659,18 +2058,13 @@ async function copyBotText(botMsg) {
   font-size: 24px;
   line-height: 1.2;
   letter-spacing: -0.02em;
-  background: linear-gradient(135deg, #f0ede6 0%, var(--color-accent) 100%);
-  -webkit-background-clip: text;
-  -webkit-text-fill-color: transparent;
-  background-clip: text;
+  color: #12263f;
+  padding-left: 12px;
+  border-left: 4px solid var(--color-accent);
 }
 
 .sidebar-header h2 {
   font-size: 22px;
-  background: linear-gradient(135deg, #f0ede6 0%, var(--color-warm) 100%);
-  -webkit-background-clip: text;
-  -webkit-text-fill-color: transparent;
-  background-clip: text;
 }
 
 .chat-header p,
@@ -1858,7 +2252,7 @@ async function copyBotText(botMsg) {
   position: absolute;
   top: 0; left: -100%;
   width: 100%; height: 100%;
-  background: linear-gradient(105deg, transparent 40%, rgba(255,255,255,0.04) 50%, transparent 60%);
+  background: linear-gradient(105deg, transparent 40%, rgba(26, 86, 219, 0.06) 50%, transparent 60%);
   transition: left 0.5s ease;
   pointer-events: none;
   z-index: 2;
@@ -1869,7 +2263,7 @@ async function copyBotText(botMsg) {
 .turn-card:hover {
   background: var(--color-surface-hover);
   border-color: var(--color-border-strong);
-  box-shadow: var(--shadow-md), 0 0 40px rgba(45, 212, 191, 0.04);
+  box-shadow: var(--shadow-md), 0 0 40px rgba(26, 86, 219, 0.08);
   transform: translateY(-2px);
 }
 
@@ -1885,7 +2279,7 @@ async function copyBotText(botMsg) {
   display: inline-flex;
   align-items: center;
   padding: 4px 12px;
-  background: linear-gradient(135deg, var(--color-accent), #0d9488);
+  background: linear-gradient(135deg, var(--color-accent), var(--color-accent-strong));
   color: #ffffff;
   font-size: 12px;
   font-weight: 600;
@@ -2102,7 +2496,7 @@ async function copyBotText(botMsg) {
   position: absolute;
   top: -100px; left: 50%; transform: translateX(-50%);
   width: 350px; height: 350px;
-  background: radial-gradient(circle, rgba(45,212,191,0.08) 0%, rgba(45,212,191,0.02) 45%, transparent 70%);
+  background: radial-gradient(circle, rgba(26, 86, 219, 0.10) 0%, rgba(26, 86, 219, 0.03) 45%, transparent 70%);
   pointer-events: none;
 }
 .welcome-avatar-wrapper {
@@ -2126,13 +2520,13 @@ async function copyBotText(botMsg) {
   border: 3px solid var(--color-bg-mid);
   border-radius: 50%;
   animation: pulse 2s infinite;
-  box-shadow: 0 0 16px rgba(52, 211, 153, 0.4);
+  box-shadow: 0 0 16px rgba(21, 128, 61, 0.35);
 }
 .welcome-greeting {
   margin: 0 0 8px;
   font-size: 26px;
   font-weight: 700;
-  background: linear-gradient(135deg, #f0ede6, var(--color-accent));
+  background: linear-gradient(135deg, #e8f0ff, var(--color-accent));
   -webkit-background-clip: text;
   -webkit-text-fill-color: transparent;
   background-clip: text;
@@ -2151,7 +2545,7 @@ async function copyBotText(botMsg) {
 }
 .welcome-chip {
   padding: 10px 20px;
-  border: 1px solid rgba(45, 212, 191, 0.16);
+  border: 1px solid rgba(26, 86, 219, 0.18);
   border-radius: var(--radius-full);
   background: var(--color-accent-soft-bg);
   color: var(--color-accent);
@@ -2201,7 +2595,7 @@ async function copyBotText(botMsg) {
   border-radius: 50%;
   object-fit: cover;
   border: 2px solid var(--color-success);
-  box-shadow: 0 0 12px rgba(52, 211, 153, 0.25);
+  box-shadow: 0 0 12px rgba(21, 128, 61, 0.25);
 }
 .typing-bubble {
   display: flex;
@@ -2254,27 +2648,27 @@ async function copyBotText(botMsg) {
 .status-warning {
   background: var(--color-warm-soft);
   color: var(--color-warm-strong);
-  border: 1px solid rgba(245, 158, 11, 0.25);
+  border: 1px solid rgba(180, 83, 9, 0.28);
 }
 .status-info {
   background: var(--color-info-soft);
   color: var(--color-info);
-  border: 1px solid rgba(56, 189, 248, 0.25);
+  border: 1px solid rgba(3, 105, 161, 0.28);
 }
 .status-success {
   background: var(--color-success-soft);
   color: var(--color-success);
-  border: 1px solid rgba(52, 211, 153, 0.25);
+  border: 1px solid rgba(21, 128, 61, 0.28);
 }
 .status-muted {
-  background: rgba(113, 111, 104, 0.12);
+  background: rgba(138, 151, 171, 0.18);
   color: var(--color-text-muted);
-  border: 1px solid rgba(113, 111, 104, 0.18);
+  border: 1px solid rgba(138, 151, 171, 0.28);
 }
 .status-danger {
   background: var(--color-danger-soft);
   color: var(--color-danger);
-  border: 1px solid rgba(251, 113, 133, 0.25);
+  border: 1px solid rgba(220, 38, 38, 0.28);
 }
 
 /* ── 商品图片（侧边栏） ────────────────────────────────────── */
@@ -2389,7 +2783,7 @@ async function copyBotText(botMsg) {
   padding-inline: 20px;
   background: linear-gradient(135deg, var(--color-accent), var(--color-accent-strong));
   border-color: transparent;
-  color: #f0fdfa;
+  color: #ffffff;
   box-shadow: 0 14px 28px var(--color-accent-glow);
 }
 .composer button:hover:not(:disabled) {
@@ -2416,7 +2810,7 @@ async function copyBotText(botMsg) {
 .tab-button.active {
   background: linear-gradient(135deg, var(--color-accent-strong), var(--color-accent));
   border-color: transparent;
-  color: #f0fdfa;
+  color: #ffffff;
   box-shadow: 0 4px 14px var(--color-accent-glow);
 }
 
@@ -2442,7 +2836,7 @@ async function copyBotText(botMsg) {
 }
 .sidebar-card:hover {
   background: var(--color-surface-hover);
-  border-color: rgba(245, 158, 11, 0.18);
+  border-color: rgba(26, 86, 219, 0.22);
   transform: translateY(-3px);
   box-shadow: var(--shadow-md), var(--shadow-glow-amber);
 }
@@ -2528,7 +2922,7 @@ async function copyBotText(botMsg) {
 }
 .suggestion-chip {
   padding: 6px 14px;
-  border: 1px solid rgba(45, 212, 191, 0.14);
+  border: 1px solid rgba(26, 86, 219, 0.18);
   border-radius: var(--radius-full);
   background: var(--color-accent-soft-bg);
   color: var(--color-accent);
@@ -2578,20 +2972,6 @@ async function copyBotText(botMsg) {
     flex-direction: column;
   }
 
-  .dh-panel {
-    flex: none;
-    width: 100%;
-    max-width: none;
-    min-height: auto;
-    height: auto;
-  }
-
-  /* 窄屏时数字人只留一个较矮的展示区，把主要空间还给聊天 */
-  .dh-stage {
-    height: 380px;
-    flex: none;
-  }
-
   .workspace {
     grid-template-columns: 1fr;
   }
@@ -2609,16 +2989,6 @@ async function copyBotText(botMsg) {
 @media (max-width: 720px) {
   .app-shell {
     padding: 0;
-  }
-
-  .dh-panel {
-    border-radius: 0;
-    border-left: none;
-    border-right: none;
-  }
-
-  .dh-stage {
-    height: 300px;
   }
 
   .workspace {
